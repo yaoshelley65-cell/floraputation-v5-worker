@@ -3,10 +3,13 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install system dependencies for PyMuPDF and Pillow
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libgl1-mesa-glx \
+RUN apt-get update --fix-missing && \
+    apt-get install -y --no-install-recommends \
     libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
