@@ -4,12 +4,25 @@ import uuid
 import fitz  # PyMuPDF
 from PIL import Image
 from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from typing import Optional
 import requests
 from datetime import datetime
 
 app = FastAPI(title="Floraputation V5 Worker")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://floraputation-v5.vercel.app",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Supabase Config
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://issvdwkurrdpeynrfobh.supabase.co")
@@ -46,7 +59,8 @@ async def trigger_processing(upload_id: str, background_tasks: BackgroundTasks):
     
     return {"message": "Processing started", "upload_id": upload_id}
 
-async def process_pdf(upload_id: str):
+
+def process_pdf(upload_id: str):
     try:
         # 1. Update status to processing
         supabase.table("uploads").update({"status": "processing"}).eq("id", upload_id).execute()
@@ -54,15 +68,14 @@ async def process_pdf(upload_id: str):
         # 2. Get upload details
         res = supabase.table("uploads").select("*").eq("id", upload_id).single().execute()
         upload_data = res.data
-        file_url = upload_data.get("file_url")
         user_id = upload_data.get("user_id")
         
-        if not file_url:
-            raise Exception("No file URL found")
-            
-        # 3. Download PDF
-        response = requests.get(file_url)
-        pdf_content = response.content
+        # 3. Download PDF from private bucket using service_role
+        # The storage path is: {user_id}/{upload_id}.pdf
+        storage_path = f"{user_id}/{upload_id}.pdf"
+        pdf_response = supabase.storage.from_("catalogs").download(storage_path)
+        pdf_content = pdf_response
+        
         doc = fitz.open(stream=pdf_content, filetype="pdf")
         
         # Update page count
@@ -82,12 +95,12 @@ async def process_pdf(upload_id: str):
                     image_bytes = base_image["image"]
                     
                     # Process image
-                    await handle_extracted_image(upload_id, user_id, page_num, image_bytes, f"p{page_num}_i{img_index}")
+                    handle_extracted_image(upload_id, user_id, page_num, image_bytes, f"p{page_num}_i{img_index}")
             else:
                 # L2: Fallback to high-res rendering
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) # 2x scale for better quality
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x scale for better quality
                 image_bytes = pix.tobytes("png")
-                await handle_extracted_image(upload_id, user_id, page_num, image_bytes, f"p{page_num}_render")
+                handle_extracted_image(upload_id, user_id, page_num, image_bytes, f"p{page_num}_render")
         
         # 5. Mark as completed
         supabase.table("uploads").update({
@@ -97,12 +110,25 @@ async def process_pdf(upload_id: str):
         
     except Exception as e:
         print(f"Error processing {upload_id}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         supabase.table("uploads").update({"status": "failed"}).eq("id", upload_id).execute()
 
-async def handle_extracted_image(upload_id: str, user_id: str, page_num: int, image_bytes: bytes, suffix: str):
+
+def handle_extracted_image(upload_id: str, user_id: str, page_num: int, image_bytes: bytes, suffix: str):
     # 1. Smart Crop (1:1 center crop)
     img = Image.open(io.BytesIO(image_bytes))
+    
+    # Convert to RGB if necessary (e.g., CMYK or RGBA)
+    if img.mode not in ("RGB",):
+        img = img.convert("RGB")
+    
     width, height = img.size
+    
+    # Skip very small images (likely icons/logos)
+    if width < 50 or height < 50:
+        return
+    
     new_size = min(width, height)
     left = (width - new_size) / 2
     top = (height - new_size) / 2
@@ -115,7 +141,7 @@ async def handle_extracted_image(upload_id: str, user_id: str, page_num: int, im
     img_cropped.save(buffer, format="JPEG", quality=90)
     processed_bytes = buffer.getvalue()
     
-    # 2. Upload to Supabase Storage (varieties bucket)
+    # 2. Upload to Supabase Storage (varieties bucket - public)
     file_name = f"{upload_id}_{suffix}.jpg"
     storage_path = f"extracted/{upload_id}/{file_name}"
     
@@ -127,31 +153,22 @@ async def handle_extracted_image(upload_id: str, user_id: str, page_num: int, im
     
     public_url = supabase.storage.from_("varieties").get_public_url(storage_path)
     
-    # 3. AI Naming Detection (Mock for now, in real app would use Vision LLM)
-    # For this demo, we'll just create a variety record if it looks like a good image
-    quality_score = 85 # Mock score
+    # 3. Quality score based on image dimensions
+    quality_score = min(100, int((width * height) / (500 * 500) * 85))
+    quality_score = max(30, min(100, quality_score))
     
     # 4. Save to extracted_images table
-    extracted_res = supabase.table("extracted_images").insert({
+    supabase.table("extracted_images").insert({
         "upload_id": upload_id,
         "page_number": page_num + 1,
         "quality_score": quality_score,
         "processed_image_url": public_url,
-        "raw_image_url": public_url, # In real app, save raw too
-        "detected_crop": "Petunia", # Mock
-        "detected_variety": f"Variety {suffix}", # Mock
+        "raw_image_url": public_url,
+        "detected_crop": "Unknown",
+        "detected_variety": f"Variety {suffix}",
+        "confidence_score": 50,
     }).execute()
-    
-    # 5. Create a variety record (Auto-promote for now)
-    if quality_score > 80:
-        supabase.table("varieties").insert({
-            "crop": "Petunia",
-            "variety": f"Variety {suffix}",
-            "image_url": public_url,
-            "quality_score": quality_score,
-            "source_upload_id": upload_id,
-            "created_by": user_id
-        }).execute()
+
 
 if __name__ == "__main__":
     import uvicorn
