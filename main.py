@@ -82,6 +82,7 @@ def process_pdf(upload_id: str):
         supabase.table("uploads").update({"page_count": len(doc)}).eq("id", upload_id).execute()
         
         # 4. Process each page
+        errors = []
         for page_num in range(len(doc)):
             page = doc[page_num]
             
@@ -90,19 +91,30 @@ def process_pdf(upload_id: str):
             
             if images:
                 for img_index, img in enumerate(images):
-                    xref = img[0]
-                    base_image = doc.extract_image(xref)
-                    image_bytes = base_image["image"]
-                    
-                    # Process image
-                    handle_extracted_image(upload_id, user_id, page_num, image_bytes, f"p{page_num}_i{img_index}")
+                    try:
+                        xref = img[0]
+                        base_image = doc.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        
+                        # Process image
+                        handle_extracted_image(upload_id, user_id, page_num, image_bytes, f"p{page_num}_i{img_index}")
+                    except Exception as img_err:
+                        errors.append(f"Page {page_num}, img {img_index}: {str(img_err)}")
+                        continue
             else:
                 # L2: Fallback to high-res rendering
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x scale for better quality
-                image_bytes = pix.tobytes("png")
-                handle_extracted_image(upload_id, user_id, page_num, image_bytes, f"p{page_num}_render")
+                try:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x scale for better quality
+                    image_bytes = pix.tobytes("png")
+                    handle_extracted_image(upload_id, user_id, page_num, image_bytes, f"p{page_num}_render")
+                except Exception as render_err:
+                    errors.append(f"Page {page_num} render: {str(render_err)}")
+                    continue
         
-        # 5. Mark as completed
+        # 5. Mark as completed (even if some individual images had errors)
+        if errors:
+            print(f"Completed with {len(errors)} errors: {errors[:5]}")
+        
         supabase.table("uploads").update({
             "status": "completed",
             "completed_at": datetime.utcnow().isoformat()
@@ -145,11 +157,22 @@ def handle_extracted_image(upload_id: str, user_id: str, page_num: int, image_by
     file_name = f"{upload_id}_{suffix}.jpg"
     storage_path = f"extracted/{upload_id}/{file_name}"
     
-    supabase.storage.from_("varieties").upload(
-        path=storage_path,
-        file=processed_bytes,
-        file_options={"content-type": "image/jpeg"}
-    )
+    try:
+        supabase.storage.from_("varieties").upload(
+            path=storage_path,
+            file=processed_bytes,
+            file_options={"content-type": "image/jpeg"}
+        )
+    except Exception as upload_err:
+        # File might already exist, try to overwrite
+        if "Duplicate" in str(upload_err) or "already exists" in str(upload_err):
+            supabase.storage.from_("varieties").update(
+                path=storage_path,
+                file=processed_bytes,
+                file_options={"content-type": "image/jpeg"}
+            )
+        else:
+            raise upload_err
     
     public_url = supabase.storage.from_("varieties").get_public_url(storage_path)
     
